@@ -1,0 +1,43 @@
+name: proxy_claude
+description: "LLM Proxy Hub — local LLM proxy & model manager for Windows with Cloudflare Tunnel support."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^2.0.0
+
+  # Networking
+  http: ^1.6.0
+
+  # Embedded local proxy server (shelf includes the shelf_io server library)
+  shelf: ^1.4.3
+  shelf_router: ^1.1.5
+
+  # State management
+  flutter_riverpod: ^3.5.0
+
+  # Storage
+  shared_preferences: ^2.5.6
+  path_provider: ^2.1.6
+  path: ^1.9.1
+
+  # Desktop integration
+  window_manager: ^0.5.2
+  # 0.8.x moved to a nativeapi-based API; the classic API (trayManager global,
+  # TrayListener, Menu/MenuItem) is provided via package:tray_manager/legacy.dart.
+  tray_manager: ^0.8.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/icon.ico
