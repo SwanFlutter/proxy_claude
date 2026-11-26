@@ -89,8 +89,11 @@ class ModelRegistry {
     );
   }
 
-  /// Replaces one provider's model set, logging additions/removals.
-  void replaceProviderModels(String providerId, List<ModelInfo> fresh,
+  /// Replaces one provider's model set, logging additions/removals, and returns
+  /// the diff so callers can report it (the old post-replace diff was always
+  /// empty, which made the sync summary misleading).
+  ({List<String> added, List<String> removed}) replaceProviderModels(
+      String providerId, List<ModelInfo> fresh,
       {String? providerLabel}) {
     final existing =
         _byKey.values.where((m) => m.providerId == providerId).toList();
@@ -111,18 +114,23 @@ class ModelRegistry {
       _logs.warn(LogCategory.sync,
           '$label: −${diff.removed.length} model(s) removed${_shortList(diff.removed)}');
     }
+    return diff;
   }
 
-  /// Converts a provider's manually-declared models into [ModelInfo]s,
-  /// skipping ids already present in [excludeIds] (or already cached).
-  List<ModelInfo> manualAsModelInfos(ProviderConfig p, {Set<String>? excludeIds}) {
+  /// Converts a provider's manually-declared models into [ModelInfo]s.
+  ///
+  /// [excludeIds] skips ids that just came from `/models`. [replaceExisting]
+  /// (curated providers) keeps every manual entry even when it is already
+  /// cached, so the caller can replace the provider's whole set.
+  List<ModelInfo> manualAsModelInfos(ProviderConfig p,
+      {Set<String>? excludeIds, bool replaceExisting = false}) {
     final now = DateTime.now();
     final out = <ModelInfo>[];
     for (final m in p.manualModels) {
       final id = m.id.trim();
       if (id.isEmpty) continue;
       if (excludeIds?.contains(id) ?? false) continue;
-      if (_byKey.containsKey('${p.id}|$id')) continue;
+      if (!replaceExisting && _byKey.containsKey('${p.id}|$id')) continue;
       out.add(ModelInfo(
         id: id,
         providerId: p.id,
@@ -130,6 +138,7 @@ class ModelRegistry {
         displayName: m.name.trim().isEmpty ? null : m.name.trim(),
         isFree: FreeModelFilter.isFree(
             modelId: id, assumeProviderFree: p.assumeAllFree),
+        manuallyAdded: true,
         lastSeen: now,
       ));
     }
@@ -144,16 +153,46 @@ class ModelRegistry {
   }) async {
     final entries = <ProviderSyncEntry>[];
     await Future.wait(providers.where((p) => p.enabled).map((p) async {
+      // Curated provider ("only my listed models"): the hand-written list IS
+      // the model list. /models is never called, so the provider's full
+      // catalogue can never leak into the routing pool.
+      if (p.manualModelsOnly && p.manualModels.isNotEmpty) {
+        final curated = manualAsModelInfos(p, replaceExisting: true);
+        final diff =
+            replaceProviderModels(p.id, curated, providerLabel: p.name);
+        entries.add(ProviderSyncEntry(
+          providerId: p.id,
+          providerName: p.name,
+          ok: true,
+          modelCount: curated.length,
+          added: diff.added,
+          removed: diff.removed,
+        ));
+        return;
+      }
+
       final outcome = await upstream.listModels(p, client: client);
       if (outcome.ok) {
-        final fetchedIds = outcome.models.map((m) => m.id).toSet();
-        final combined = [...outcome.models, ...manualAsModelInfos(p, excludeIds: fetchedIds)];
-        replaceProviderModels(p.id, combined, providerLabel: p.name);
-        final existing = forProvider(p.id);
-        final diff = diffIds(
-          existing.map((m) => m.id).toSet(),
-          combined.map((m) => m.id).toSet(),
-        );
+        // **Known** providers (OpenRouter, Groq, Gemini, OpenAI, Anthropic,
+        // DeepSeek) are registered free-only: their paid catalogue is noise for
+        // a personal proxy and would dominate both the model list and routing.
+        // A **custom** provider is the user's own gateway, so everything it
+        // returns stays — free or paid (e.g. a daily-credit key).
+        var fetched = outcome.models;
+        if (!p.isCustom) {
+          fetched = fetched.where((m) => m.isFree).toList();
+          final dropped = outcome.models.length - fetched.length;
+          if (dropped > 0) {
+            _logs.info(
+                LogCategory.sync,
+                '${p.name}: skipped $dropped paid model(s) — known providers '
+                'only register free models');
+          }
+        }
+        final fetchedIds = fetched.map((m) => m.id).toSet();
+        final combined = [...fetched, ...manualAsModelInfos(p, excludeIds: fetchedIds)];
+        final diff =
+            replaceProviderModels(p.id, combined, providerLabel: p.name);
         entries.add(ProviderSyncEntry(
           providerId: p.id,
           providerName: p.name,

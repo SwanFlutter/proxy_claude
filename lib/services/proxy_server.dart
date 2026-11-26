@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
+import '../core/model_router.dart';
 import '../models/log_entry.dart';
 import 'anthropic_gateway.dart';
 import 'chat_proxy_core.dart';
@@ -137,21 +138,70 @@ class ProxyServer {
       });
 
   Future<Response> _models(Request req) async {
-    var models = registry.snapshot;
     final q = req.url.queryParameters;
-    // Show only free models by default when the user enabled "free only",
-    // so Claude Code's model discovery surfaces the usable free catalog
-    // (e.g. Gemma 4) instead of hundreds of paid/deprecated entries.
+    final s = settings.appSettings;
+    final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+    // Virtual model(s): one id backed by every connected provider. This is what
+    // clients should use so no model ever has to be chosen upstream.
+    final virtual = <Map<String, dynamic>>[
+      if (s.exposeAutoModel)
+        for (final id in AutoModel.served)
+          {
+            'id': id,
+            'object': 'model',
+            'created': nowSec,
+            'owned_by': 'llm-proxy-hub',
+            'anthropic_family_tier': _familyTier(id),
+            'display_name': switch (id) {
+              AutoModel.strongVariant => 'Auto (strongest models first)',
+              AutoModel.fastVariant => 'Auto (lightest models first)',
+              _ => AutoModel.displayName,
+            },
+            'llm_proxy': {
+              'virtual': true,
+              'routing': id == AutoModel.canonical
+                  ? 'smart: strongest first, small models for trivial tasks'
+                  : id == AutoModel.strongVariant
+                      ? 'always start at the strongest tier'
+                      : 'always start at the lightest tier',
+              'providers': registry.snapshot
+                  .map((m) => m.providerId)
+                  .toSet()
+                  .length,
+              'models': registry.count,
+            },
+          }
+    ];
+
+    // "Only the proxy model": clients see `auto` and nothing else. Real ids keep
+    // working when requested explicitly — they are simply not advertised.
+    if (s.exposeAutoModel && s.autoModelOnly) {
+      return _jsonResponse(200, {'object': 'list', 'data': virtual});
+    }
+
+    var models = registry.snapshot;
+    // Show only free models by default when the user enabled "free only", so
+    // Claude Code's model discovery surfaces the usable catalog instead of
+    // hundreds of paid/deprecated entries. Free-flagged models plus manually
+    // declared (curated gateway) models are served; missing pricing metadata is
+    // never treated as free.
     // Override with ?all=true to see everything, or ?free=true to force free.
     final wantAll = q['all'] == 'true' || q['all'] == '1';
     final wantFree = q['free'] == 'true' || q['free'] == '1';
-    if (wantFree || (settings.appSettings.showFreeOnly && !wantAll)) {
-      models = models.where((m) => m.isFree).toList();
+    // Custom providers are the user's own gateways: **all** of their models are
+    // served, free or paid (a daily-credit key is still theirs to use).
+    final customIds = {for (final p in settings.providers) if (p.isCustom) p.id};
+    if (wantFree || (s.showFreeOnly && !wantAll)) {
+      models = models
+          .where((m) => m.visibleInFreeView || customIds.contains(m.providerId))
+          .toList();
     }
-    final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
     return _jsonResponse(200, {
       'object': 'list',
       'data': [
+        ...virtual,
         for (final m in models)
           {
             'id': m.id,
@@ -169,6 +219,7 @@ class ProxyServer {
               'provider_id': m.providerId,
               'free': m.isFree,
               'context_length': m.contextLength,
+              'auto_tier': ModelCapability.tier(m).label,
             },
           }
       ],
@@ -180,6 +231,11 @@ class ProxyServer {
   /// models for Auto mode; explicit selection uses the real model id.
   String _familyTier(String id) {
     final x = id.toLowerCase();
+    // Virtual auto model: Claude Code's "Auto" tier mapping lands it on Sonnet,
+    // its strategy variants on Opus (strong) and Haiku (fast).
+    if (x == AutoModel.canonical) return 'sonnet';
+    if (x == AutoModel.strongVariant) return 'opus';
+    if (x == AutoModel.fastVariant) return 'haiku';
     if (x.contains('ultra') || x.contains('super') || x.contains('550b') ||
         x.contains('opus') || x.contains('pro-max')) {
       return 'opus';

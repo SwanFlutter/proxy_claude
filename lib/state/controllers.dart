@@ -6,6 +6,7 @@ import '../models/model_info.dart';
 import '../models/provider_config.dart';
 import '../models/settings.dart';
 import '../services/chat_proxy_core.dart';
+import '../services/claude_code_config.dart';
 import '../services/log_service.dart';
 import '../services/model_registry.dart';
 import '../services/proxy_server.dart';
@@ -38,6 +39,7 @@ final chatCoreProvider = Provider<ChatProxyCore>((ref) {
     upstream: ref.watch(upstreamClientProvider),
     enabledProviders: () => svc.enabledProviders,
     defaultModel: () => svc.appSettings.defaultModel,
+    smartTaskRouting: () => svc.appSettings.smartTaskRouting,
   );
 });
 
@@ -76,12 +78,27 @@ class ProvidersNotifier extends Notifier<List<ProviderConfig>> {
   Future<void> upsert(ProviderConfig p, {String? apiKey}) async {
     final svc = ref.read(settingsServiceProvider);
     final idx = svc.providers.indexWhere((e) => e.id == p.id);
+    // A freshly connected provider joins routing **immediately** — no separate
+    // "enabled" switch to flip. Editing an existing record keeps whatever the
+    // user had set it to.
+    final record = idx >= 0 ? p : p.copyWith(enabled: true);
     if (idx >= 0) {
-      svc.providers[idx] = p;
+      svc.providers[idx] = record;
     } else {
-      svc.providers.add(p);
+      svc.providers.add(record);
     }
     if (apiKey != null) await svc.setProviderApiKey(p.id, apiKey);
+    await svc.saveProviders();
+    state = [...svc.providers];
+  }
+
+  /// Turns every configured provider on (routing pool = all of them).
+  Future<void> setEnabledAll(bool enabled) async {
+    final svc = ref.read(settingsServiceProvider);
+    if (svc.providers.every((p) => p.enabled == enabled)) return;
+    svc.providers = [
+      for (final p in svc.providers) p.copyWith(enabled: enabled),
+    ];
     await svc.saveProviders();
     state = [...svc.providers];
   }
@@ -321,8 +338,12 @@ class SyncController extends Notifier<SyncState> {
     final registry = ref.read(registryProvider);
     final upstream = ref.read(upstreamClientProvider);
     final logs = ref.read(logServiceProvider);
-    final providers =
+    final enabled =
         ref.read(providersProvider).where((p) => p.enabled).toList();
+    // Providers without any credential cannot be listed: they are reported with
+    // an explicit reason instead of silently showing up as "0 models".
+    final providers = enabled.where((p) => !p.needsApiKey).toList();
+    final blocked = enabled.where((p) => p.needsApiKey).toList();
 
     state = SyncState(
       syncing: true,
@@ -332,14 +353,22 @@ class SyncController extends Notifier<SyncState> {
       lastSummary: state.lastSummary,
     );
 
-    if (providers.isEmpty) {
+    if (enabled.isEmpty) {
       state = state.copyWith(syncing: false, lastSummary: 'No providers enabled');
       return;
     }
 
-    logs.info(LogCategory.sync, 'Syncing models from ${providers.length} provider(s)…');
+    if (providers.isNotEmpty) {
+      logs.info(LogCategory.sync, 'Syncing models from ${providers.length} provider(s)…');
+    }
+    for (final p in blocked) {
+      logs.warn(LogCategory.sync,
+          '${p.name}: skipped — no API key configured (open Providers and paste the key)');
+    }
     try {
-      final report = await registry.syncAll(providers, upstream: upstream);
+      final report = providers.isEmpty
+          ? const SyncReport(entries: [])
+          : await registry.syncAll(providers, upstream: upstream);
       final health = <String, ProviderHealth>{};
       for (final e in report.entries) {
         health[e.providerId] = ProviderHealth(
@@ -350,8 +379,16 @@ class SyncController extends Notifier<SyncState> {
           removed: e.removed.length,
         );
       }
+      for (final p in blocked) {
+        health[p.id] = const ProviderHealth(
+          ok: false,
+          modelCount: 0,
+          error: 'No API key configured',
+        );
+      }
       final okCount = report.entries.where((e) => e.ok).length;
-      final summary = '$okCount/${report.entries.length} providers OK · '
+      final summary = '$okCount/${report.entries.length} providers OK'
+          '${blocked.isNotEmpty ? ' · ${blocked.length} need a key' : ''} · '
           '${registry.count} models (+${report.addedTotal}/−${report.removedTotal})';
       final interval = ref.read(settingsNotifierProvider).syncIntervalMinutes;
       state = SyncState(
@@ -387,3 +424,273 @@ final syncControllerProvider =
 
 final modelsStreamProvider =
     StreamProvider<List<ModelInfo>>((ref) => ref.watch(registryProvider).changes);
+
+// ── Claude Code integration ───────────────────────────────────────────────
+//
+// Everything Claude Code needs (URL + proxy key + model names) is written into
+// Claude Code's own settings.json from inside the app, and kept in sync when the
+// tunnel URL changes — a quick tunnel gets a brand new host on every start, so
+// a hand-edited file breaks on the next restart.
+
+class ClaudeCodeState {
+  final String path;
+  final String baseUrl;
+  final bool usingTunnel;
+  final bool tunnelReady;
+  final bool busy;
+  final ClaudeInstallState install;
+  final List<String> lastChanges;
+  final String? backupPath;
+  final String? error;
+
+  const ClaudeCodeState({
+    this.path = '',
+    this.baseUrl = '',
+    this.usingTunnel = false,
+    this.tunnelReady = false,
+    this.busy = false,
+    this.install = const ClaudeInstallState(exists: false, installed: false),
+    this.lastChanges = const [],
+    this.backupPath,
+    this.error,
+  });
+
+  ClaudeCodeState copyWith({
+    String? path,
+    String? baseUrl,
+    bool? usingTunnel,
+    bool? tunnelReady,
+    bool? busy,
+    ClaudeInstallState? install,
+    List<String>? lastChanges,
+    Object? backupPath = _noValue,
+    Object? error = _noValue,
+  }) =>
+      ClaudeCodeState(
+        path: path ?? this.path,
+        baseUrl: baseUrl ?? this.baseUrl,
+        usingTunnel: usingTunnel ?? this.usingTunnel,
+        tunnelReady: tunnelReady ?? this.tunnelReady,
+        busy: busy ?? this.busy,
+        install: install ?? this.install,
+        lastChanges: lastChanges ?? this.lastChanges,
+        backupPath: backupPath == _noValue ? this.backupPath : backupPath as String?,
+        error: error == _noValue ? this.error : error as String?,
+      );
+
+  bool get upToDate => install.upToDate && install.baseUrl == baseUrl;
+}
+
+const _noValue = Object();
+
+class ClaudeCodeController extends Notifier<ClaudeCodeState> {
+  /// Notifier has no `mounted`; guard the async write paths ourselves.
+  bool _alive = true;
+
+  @override
+  ClaudeCodeState build() {
+    _alive = true;
+    ref.onDispose(() => _alive = false);
+    // Reactive: rebuilds when the tunnel URL or the settings change.
+    final s = ref.watch(settingsNotifierProvider);
+    final t = ref.watch(tunnelControllerProvider);
+    final plan = _planFor(s, t);
+    return ClaudeCodeState(
+      path: plan.path,
+      baseUrl: plan.baseUrl,
+      usingTunnel: plan.useTunnel,
+      tunnelReady: plan.tunnelReady,
+    );
+  }
+
+  /// Where Claude Code should point, and whether that target actually exists.
+  ({String path, String baseUrl, bool useTunnel, bool tunnelReady}) _planFor(
+      AppSettings s, TunnelRuntime t) {
+    final ready = t.publicUrl != null && t.publicUrl!.isNotEmpty;
+    final useTunnel = s.claudeCodeUseTunnel;
+    return (
+      path: ClaudeCodeConfig.resolvePath(s.claudeCodePath),
+      baseUrl: useTunnel && ready
+          ? t.publicUrl!
+          : 'http://127.0.0.1:${s.port}',
+      useTunnel: useTunnel,
+      tunnelReady: ready,
+    );
+  }
+
+  /// The exact env block this app would write for [baseUrl].
+  /// Non-reactive variant for use inside async methods.
+  ({String path, String baseUrl, bool useTunnel, bool tunnelReady}) _plan() =>
+      _planFor(ref.read(settingsNotifierProvider),
+          ref.read(tunnelControllerProvider));
+
+  Map<String, String> _expected(String baseUrl) {
+    final svc = ref.read(settingsServiceProvider);
+    return ClaudeCodeConfig.envFor(
+      baseUrl: baseUrl,
+      authToken: svc.localApiKey,
+      autoModels: svc.appSettings.claudeCodeAutoModels,
+    );
+  }
+
+  Future<void> refresh() async {
+    final plan = _plan();
+    final current = await ClaudeCodeConfig.inspect(plan.path,
+        expected: _expected(plan.baseUrl));
+    if (!_alive) return;
+    state = state.copyWith(
+      path: plan.path,
+      baseUrl: plan.baseUrl,
+      usingTunnel: plan.useTunnel,
+      tunnelReady: plan.tunnelReady,
+      install: current,
+    );
+  }
+
+  /// Writes the config. Returns null when the file was already correct.
+  Future<ClaudeWriteResult?> apply({String? reason}) async {
+    final plan = _plan();
+    if (plan.useTunnel && !plan.tunnelReady) {
+      state = state.copyWith(
+          error: 'Tunnel is not connected yet — start it below (or switch to '
+              'the local URL) before writing the config.');
+      return null;
+    }
+    state = state.copyWith(busy: true, error: null);
+    try {
+      final env = _expected(plan.baseUrl);
+      final result = await ClaudeCodeConfig.write(path: plan.path, env: env);
+      final inspect =
+          await ClaudeCodeConfig.inspect(plan.path, expected: env);
+      if (!_alive) return result;
+      state = state.copyWith(
+        busy: false,
+        path: plan.path,
+        baseUrl: plan.baseUrl,
+        usingTunnel: plan.useTunnel,
+        tunnelReady: plan.tunnelReady,
+        install: inspect,
+        lastChanges: result.changes,
+        backupPath: result.backupPath,
+      );
+      if (result.changed) {
+        ref.read(logServiceProvider).info(
+            LogCategory.request,
+            'Claude Code config ${reason ?? 'updated'} → ${plan.path}'
+                '${result.backupPath == null ? '' : ' (backup: ${result.backupPath})'}\n'
+                '${result.changes.join('\n')}');
+      }
+      return result.changed ? result : null;
+    } catch (e) {
+      if (_alive) state = state.copyWith(busy: false, error: '$e');
+      return null;
+    }
+  }
+
+  Future<ClaudeWriteResult?> remove() async {
+    state = state.copyWith(busy: true, error: null);
+    try {
+      final plan = _plan();
+      final result = await ClaudeCodeConfig.remove(path: plan.path);
+      final inspect = await ClaudeCodeConfig.inspect(plan.path,
+          expected: _expected(plan.baseUrl));
+      if (!_alive) return result;
+      state = state.copyWith(
+        busy: false,
+        install: inspect,
+        lastChanges: result.changes,
+        backupPath: result.backupPath,
+      );
+      ref.read(logServiceProvider).info(LogCategory.request,
+          'Claude Code config cleaned → ${plan.path} (${result.changes.length} key(s))');
+      return result;
+    } catch (e) {
+      if (_alive) state = state.copyWith(busy: false, error: '$e');
+      return null;
+    }
+  }
+
+  /// Called when the tunnel (re)connects: refresh, and rewrite when it is on.
+  Future<void> syncAfterTunnelChange() async {
+    await refresh();
+    if (!ref.read(settingsNotifierProvider).claudeCodeKeepInSync) return;
+    if (state.upToDate) return;
+    if (state.usingTunnel && !state.tunnelReady) return;
+    await apply(reason: 'auto-synced with the tunnel URL');
+  }
+
+  /// Starts the Cloudflare tunnel and waits (max ~25s) for its public URL.
+  /// Claude Code over the tunnel is useless without it.
+  Future<bool> ensureTunnel() async {
+    final tunnel = ref.read(tunnelControllerProvider.notifier);
+    if (!state.tunnelReady) await tunnel.connect();
+    for (var i = 0; i < 50; i++) {
+      await refresh();
+      if (state.tunnelReady) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+    }
+    if (_alive) {
+      state = state.copyWith(
+          error: 'The tunnel did not report a public URL. Open Settings → '
+              'Cloudflare Tunnel and check the logs.');
+    }
+    return false;
+  }
+
+  /// Write Claude Code's config, starting the tunnel first when it is the
+  /// selected target.
+  Future<ClaudeWriteResult?> install() async {
+    if (state.usingTunnel && !state.tunnelReady) {
+      if (!await ensureTunnel()) return null;
+    }
+    return apply(reason: 'installed from the app');
+  }
+}
+
+final claudeCodeControllerProvider =
+    NotifierProvider<ClaudeCodeController, ClaudeCodeState>(
+        ClaudeCodeController.new);
+
+/// Watches the tunnel + settings and keeps Claude Code's settings.json aligned
+/// while the app runs (also alive when the window is hidden in the tray).
+/// Rewrites only when the **target** changed, so a hand-edit is never stomped
+/// on every keystroke.
+final claudeCodeAutoSyncProvider = Provider<void>((ref) {
+  String? lastTarget;
+  var queued = false;
+
+  Future<void> check(String reason) async {
+    if (queued) return;
+    queued = true;
+    try {
+      final settings = ref.read(settingsNotifierProvider);
+      if (!settings.claudeCodeKeepInSync) return;
+      final controller = ref.read(claudeCodeControllerProvider.notifier);
+      await controller.refresh();
+      final st = ref.read(claudeCodeControllerProvider);
+      if (st.usingTunnel && !st.tunnelReady) return; // keep the last good URL
+      // First observation: adopt whatever is live without writing yet.
+      lastTarget ??= st.baseUrl;
+      if (st.upToDate || lastTarget == st.baseUrl) return;
+      lastTarget = st.baseUrl;
+      await controller.apply(reason: reason);
+    } finally {
+      queued = false;
+    }
+  }
+
+  ref.listen(tunnelControllerProvider, (prev, next) {
+    if (prev?.publicUrl == next.publicUrl && prev?.status == next.status) return;
+    check('tunnel ${next.publicUrl == null ? 'stopped' : 'moved'} → auto-sync');
+  });
+  ref.listen(settingsNotifierProvider, (prev, next) {
+    if (prev?.port == next.port &&
+        prev?.claudeCodePath == next.claudeCodePath &&
+        prev?.claudeCodeUseTunnel == next.claudeCodeUseTunnel &&
+        prev?.claudeCodeAutoModels == next.claudeCodeAutoModels) {
+      return;
+    }
+    check('settings changed → auto-sync');
+  });
+  check('startup');
+});

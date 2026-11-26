@@ -81,6 +81,11 @@ class _ProxyHubAppState extends ConsumerState<ProxyHubApp>
     await container.read(syncControllerProvider.notifier).syncNow();
     if (!mounted) return;
 
+    // Claude Code integration: keeps %USERPROFILE%\.claude\settings.json pointed
+    // at the live URL (a quick tunnel changes host on every start). Stays alive
+    // with the container, so it also works while the window is in the tray.
+    container.read(claudeCodeAutoSyncProvider);
+
     if (settings.minimizeToTray) {
       await _setupTray(container);
     }

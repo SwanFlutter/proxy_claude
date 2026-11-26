@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import '../core/model_router.dart';
 import '../core/utils.dart';
 import '../models/log_entry.dart';
 import '../models/model_info.dart';
@@ -16,19 +17,106 @@ class FailoverCandidate {
   const FailoverCandidate(this.provider, this.model);
 }
 
-/// Pure, unit-testable routing/failover chain builder.
+/// What the virtual `auto` model decided for one request.
+class AutoDecision {
+  /// Tier the chain starts from (`auto:strong` → strong, smart → task-based).
+  final ModelTier targetTier;
+
+  /// True when the tier came from an explicit alias instead of the classifier.
+  final bool tierForced;
+  final AutoPlan plan;
+
+  const AutoDecision({
+    required this.targetTier,
+    required this.tierForced,
+    required this.plan,
+  });
+}
+
+/// Chain plus (optional) auto-routing decision, for logging and headers.
+class ChainResult {
+  final List<FailoverCandidate> chain;
+  final AutoDecision? auto;
+
+  const ChainResult({required this.chain, this.auto});
+}
+
+/// Candidate ordering when the virtual `auto` model is requested.
 ///
-/// Order of candidates:
+/// All models of every **enabled** provider compete:
+///  1. closest capability tier to the target (equidistant tiers escalate
+///     upwards first, so failures make the request stronger, not weaker);
+///  2. inside a tier: free ▸ no-pricing-metadata (private gateways, manual
+///     models) ▸ known-paid, then the estimated capability score;
+///  3. known-paid models only as a final safety net (`AutoChain.maxPaid`), so a
+///     huge paid catalogue can never crowd out models that actually answer.
+///
+/// When [targetTier] is null the tier is picked by [TaskRouter.assess] (smart
+/// routing) or defaults to the strongest tier.
+List<FailoverCandidate> buildAutoChain({
+  required List<ModelInfo> models,
+  required List<ProviderConfig> providers,
+  ModelTier? targetTier,
+  AutoPlan? plan,
+  ProviderConfig? forcedProvider,
+  int maxCandidates = 10,
+}) {
+  final allowed = <String>{for (final p in providers) p.id};
+  final pool = models
+      .where((m) =>
+          allowed.contains(m.providerId) &&
+          (forcedProvider == null || m.providerId == forcedProvider.id))
+      .toList();
+
+  final target = targetTier ??
+      (plan != null
+          ? plan.targetTier
+          : ModelTier.strong); // "strongest first" when nothing is known
+
+  final byId = <String, ProviderConfig>{for (final p in providers) p.id: p};
+  // Models of a custom provider are the user's own gateway + own credit plan:
+  // they must not be demoted behind the "known-paid" safety cap.
+  final consented = <String>{
+    for (final m in pool)
+      if (byId[m.providerId]?.isCustom ?? false) m.key,
+  };
+  final ordered = AutoChain.order(
+    models: pool,
+    target: target,
+    maxCandidates: maxCandidates,
+    consented: consented,
+  );
+
+  final chain = <FailoverCandidate>[];
+  for (final m in ordered) {
+    final p = byId[m.providerId];
+    if (p == null) continue;
+    chain.add(FailoverCandidate(p, m));
+  }
+  return chain;
+}
+
+/// Resolves [requestedModel] into an ordered candidate chain.
+///
+/// Concrete model (unchanged behaviour):
 ///  1. primary — the requested model (optionally `providerId/modelId`)
 ///  2. up to 2 same-provider siblings (free models first)
 ///  3. one fallback model per remaining enabled provider (free first)
 ///  4. the configured default model as a last resort
-List<FailoverCandidate> buildFailoverChain({
+///
+/// Virtual `auto` model, or a model that is not in the cache any more:
+///  → [buildAutoChain] with a tier chosen by smart routing (or forced by the
+///    alias), so **all providers' models stay reachable without the client
+///    having to pick one**.
+ChainResult buildChain({
   required List<ModelInfo> models,
   required List<ProviderConfig> providers,
   required String requestedModel,
   String? defaultModel,
   int maxCandidates = 6,
+  int autoMaxCandidates = 10,
+  bool smartTaskRouting = true,
+  Map<String, dynamic>? requestBody,
 }) {
   final chain = <FailoverCandidate>[];
   final seen = <String>{};
@@ -40,9 +128,10 @@ List<FailoverCandidate> buildFailoverChain({
     return null;
   }
 
+  var cap = maxCandidates;
   void push(ProviderConfig p, ModelInfo m) {
     if (seen.contains(m.key)) return;
-    if (chain.length >= maxCandidates) return;
+    if (chain.length >= cap) return;
     seen.add(m.key);
     chain.add(FailoverCandidate(p, m));
   }
@@ -67,8 +156,10 @@ List<FailoverCandidate> buildFailoverChain({
     }
   }
 
+  // A real model always wins over the virtual one (a provider could literally
+  // expose a model called "auto").
   ModelInfo? primary;
-  if (bare.isNotEmpty) {
+  if (bare.isNotEmpty && !AutoModel.matches(bare)) {
     for (final m in models) {
       if (m.id == bare) {
         primary = m;
@@ -85,6 +176,49 @@ List<FailoverCandidate> buildFailoverChain({
     }
   }
 
+  final wantsAuto = primary == null && AutoModel.matches(bare);
+  final unknownModel = primary == null && !wantsAuto;
+
+  if (wantsAuto || (unknownModel && (defaultModel == null || defaultModel.isEmpty))) {
+    // Virtual model (and unknown models without a configured default):
+    // rank every enabled provider's models by capability + cost.
+    AutoPlan plan;
+    ModelTier? target;
+    var forcedTier = false;
+    final pinned = AutoModel.forcedTier(bare);
+    if (pinned != null) {
+      target = pinned;
+      forcedTier = true;
+      plan = AutoPlan(
+        complexity: TaskComplexity.complex,
+        targetTier: pinned,
+        reason: 'tier pinned by "$bare"',
+      );
+    } else if (smartTaskRouting && requestBody != null) {
+      plan = TaskRouter.assess(requestBody);
+      target = plan.targetTier;
+    } else {
+      plan = const AutoPlan(
+        complexity: TaskComplexity.complex,
+        targetTier: ModelTier.strong,
+        reason: 'smart routing off — strongest first',
+      );
+      target = ModelTier.strong;
+    }
+    final autoChain = buildAutoChain(
+      models: models,
+      providers: providers,
+      targetTier: target,
+      forcedProvider: forced,
+      maxCandidates: autoMaxCandidates,
+    );
+    return ChainResult(
+      chain: autoChain,
+      auto: AutoDecision(
+          targetTier: target, tierForced: forcedTier, plan: plan),
+    );
+  }
+
   // Resolve the configured default model once. It is treated as a known-good
   // preferred fallback and tried immediately after the primary (or first when
   // the requested model is unknown), BEFORE alphabetical free siblings — many
@@ -99,6 +233,35 @@ List<FailoverCandidate> buildFailoverChain({
         break;
       }
     }
+  }
+
+  if (unknownModel) {
+    // Unknown model with a configured default: known-good default first, then
+    // the smart auto chain behind it (so a stale Claude Code model name still
+    // reaches every provider instead of 404-ing).
+    if (defaultInfo != null && defaultProv != null) push(defaultProv, defaultInfo);
+    cap = autoMaxCandidates;
+    final plan = smartTaskRouting && requestBody != null
+        ? TaskRouter.assess(requestBody)
+        : const AutoPlan(
+            complexity: TaskComplexity.complex,
+            targetTier: ModelTier.strong,
+            reason: 'smart routing off — strongest first',
+          );
+    for (final c in buildAutoChain(
+      models: models,
+      providers: providers,
+      targetTier: plan.targetTier,
+      forcedProvider: forced,
+      maxCandidates: autoMaxCandidates,
+    )) {
+      push(c.provider, c.model);
+    }
+    return ChainResult(
+      chain: chain,
+      auto: AutoDecision(
+          targetTier: plan.targetTier, tierForced: false, plan: plan),
+    );
   }
 
   if (primary != null) {
@@ -130,8 +293,28 @@ List<FailoverCandidate> buildFailoverChain({
     if (own.isNotEmpty) push(p, own.first);
   }
 
-  return chain;
+  return ChainResult(chain: chain);
 }
+
+/// Backwards-compatible helper: just the candidate list.
+List<FailoverCandidate> buildFailoverChain({
+  required List<ModelInfo> models,
+  required List<ProviderConfig> providers,
+  required String requestedModel,
+  String? defaultModel,
+  int maxCandidates = 6,
+  bool smartTaskRouting = true,
+  Map<String, dynamic>? requestBody,
+}) =>
+    buildChain(
+      models: models,
+      providers: providers,
+      requestedModel: requestedModel,
+      defaultModel: defaultModel,
+      maxCandidates: maxCandidates,
+      smartTaskRouting: smartTaskRouting,
+      requestBody: requestBody,
+    ).chain;
 
 class ChatOutcome {
   final int statusCode;
@@ -192,13 +375,22 @@ class ChatProxyCore {
     required this.defaultModel,
     required this.upstream,
     required this.logs,
-  });
+    bool Function()? smartTaskRouting,
+    int Function()? autoMaxCandidates,
+  })  : smartTaskRouting = smartTaskRouting ?? (() => true),
+        autoMaxCandidates = autoMaxCandidates ?? (() => 10);
 
   final ModelRegistry registry;
   final List<ProviderConfig> Function() enabledProviders;
   final String? Function() defaultModel;
   final UpstreamClient upstream;
   final LogService logs;
+
+  /// Classify each request and start small for trivial tasks (`auto` only).
+  final bool Function() smartTaskRouting;
+
+  /// How many models the `auto` chain may try before giving up.
+  final int Function() autoMaxCandidates;
 
   Future<ChatOutcome> chat(
     Map<String, dynamic> body, {
@@ -208,12 +400,24 @@ class ChatProxyCore {
     final providers = enabledProviders();
     final requested = (body['model'] ?? '').toString();
     final wantStream = body['stream'] == true;
-    final chain = buildFailoverChain(
+    final result = buildChain(
       models: registry.snapshot,
       providers: providers,
       requestedModel: requested,
       defaultModel: defaultModel(),
+      autoMaxCandidates: autoMaxCandidates(),
+      smartTaskRouting: smartTaskRouting(),
+      requestBody: body,
     );
+    final chain = result.chain;
+    final auto = result.auto;
+    if (auto != null) {
+      logs.info(
+          LogCategory.request,
+          'auto · "$requested" → ${auto.plan} · ${chain.length} candidate(s): '
+          '${chain.take(4).map((c) => '${c.provider.id}/${c.model.id}').join(', ')}'
+          '${chain.length > 4 ? ' …' : ''}');
+    }
     if (chain.isEmpty) {
       return ChatOutcome.error(
         404,
@@ -273,7 +477,7 @@ class ChatProxyCore {
             statusCode: status,
             contentType: resp.headers['content-type'] ?? 'text/event-stream',
             stream: stream,
-            headers: _proxyHeaders(cand, i + 1),
+            headers: _proxyHeaders(cand, i + 1, auto),
             providerId: cand.provider.id,
             modelId: cand.model.id,
             attempts: i + 1,
@@ -294,7 +498,7 @@ class ChatProxyCore {
             statusCode: status,
             contentType: resp.headers['content-type'] ?? 'application/json',
             bytes: bytes,
-            headers: _proxyHeaders(cand, i + 1),
+            headers: _proxyHeaders(cand, i + 1, auto),
             providerId: cand.provider.id,
             modelId: cand.model.id,
             attempts: i + 1,
@@ -356,10 +560,19 @@ class ChatProxyCore {
     );
   }
 
-  Map<String, String> _proxyHeaders(FailoverCandidate cand, int attempt) => {
+  Map<String, String> _proxyHeaders(
+    FailoverCandidate cand,
+    int attempt, [
+    AutoDecision? auto,
+  ]) =>
+      {
         'x-proxy-provider': cand.provider.id,
         'x-proxy-model': cand.model.id,
         'x-proxy-attempt': '$attempt',
+        if (auto != null) ...{
+          'x-proxy-auto-tier': auto.targetTier.label,
+          'x-proxy-auto-task': auto.plan.complexity.label,
+        },
       };
 
   String _attemptLine(

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/model_router.dart';
 import '../../models/log_entry.dart';
 import '../../models/settings.dart';
 import '../../services/log_service.dart';
@@ -22,6 +23,20 @@ class DashboardPage extends ConsumerWidget {
 
     final okProviders = sync.health.values.where((h) => h.ok).length;
     final totalProviders = sync.health.length;
+
+    // What the virtual `auto` model currently has to choose from.
+    final providerIds = models.map((m) => m.providerId).toSet();
+    final strongCount =
+        models.where((m) => ModelCapability.tier(m) == ModelTier.strong).length;
+    final balancedCount = models
+        .where((m) => ModelCapability.tier(m) == ModelTier.balanced)
+        .length;
+    final lightCount =
+        models.where((m) => ModelCapability.tier(m) == ModelTier.light).length;
+    final autoPool = providerIds.isEmpty
+        ? 'No models synced yet'
+        : '${providerIds.length} provider(s) · $strongCount strong · '
+            '$balancedCount balanced · $lightCount light';
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -113,7 +128,11 @@ class DashboardPage extends ConsumerWidget {
           ],
         ),
         const SizedBox(height: 12),
-        _EndpointsCard(proxy: proxy, tunnel: tunnel, settings: settings),
+        _EndpointsCard(
+            proxy: proxy,
+            tunnel: tunnel,
+            settings: settings,
+            autoPool: autoPool),
         const SizedBox(height: 12),
         _QuickActions(proxy: proxy, tunnel: tunnel),
         const SizedBox(height: 12),
@@ -199,9 +218,13 @@ class _EndpointsCard extends ConsumerWidget {
   final ProxyState proxy;
   final TunnelRuntime tunnel;
   final AppSettings settings;
+  final String autoPool;
 
   const _EndpointsCard(
-      {required this.proxy, required this.tunnel, required this.settings});
+      {required this.proxy,
+      required this.tunnel,
+      required this.settings,
+      this.autoPool = ''});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -224,6 +247,13 @@ class _EndpointsCard extends ConsumerWidget {
             _endpointRow(context, 'Public', publicUrl, 'Via Cloudflare Tunnel'),
           _endpointRow(
               context, 'Proxy key', localKey, 'Authorization: Bearer <key> / X-API-Key'),
+          if (settings.exposeAutoModel)
+            _endpointRow(
+                context,
+                'Model',
+                AutoModel.canonical,
+                'One id for every provider — nothing to pick. $autoPool · '
+                    'variants: ${AutoModel.strongVariant}, ${AutoModel.fastVariant}'),
         ],
       ),
     );

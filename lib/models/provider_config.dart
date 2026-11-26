@@ -66,6 +66,14 @@ class ProviderConfig {
   final bool enabled;
   final bool assumeAllFree;
   final List<ManualModel> manualModels;
+
+  /// **Curated list**: never call the provider's `/models` endpoint — only the
+  /// manually-declared [manualModels] are registered and routed.
+  ///
+  /// Default for records written before this flag existed: `true` as soon as a
+  /// provider has a manual list, because listing models by hand means "these
+  /// and only these".
+  final bool manualModelsOnly;
   final String apiKey;
 
   const ProviderConfig({
@@ -79,10 +87,24 @@ class ProviderConfig {
     required this.enabled,
     required this.assumeAllFree,
     this.manualModels = const [],
+    this.manualModelsOnly = false,
     this.apiKey = '',
   });
 
   bool get isCustom => preset == ProviderPreset.custom;
+
+  /// True when nothing can authenticate requests: no API key and no custom
+  /// header that looks like a credential (some gateways auth via headers).
+  bool get needsApiKey {
+    if (apiKey.trim().isNotEmpty) return false;
+    for (final k in extraHeaders.keys) {
+      final h = k.toLowerCase();
+      if (h.contains('auth') || h.contains('key') || h.contains('token')) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   ProviderConfig copyWith({
     String? name,
@@ -93,6 +115,7 @@ class ProviderConfig {
     bool? enabled,
     bool? assumeAllFree,
     List<ManualModel>? manualModels,
+    bool? manualModelsOnly,
     String? apiKey,
   }) =>
       ProviderConfig(
@@ -106,6 +129,7 @@ class ProviderConfig {
         enabled: enabled ?? this.enabled,
         assumeAllFree: assumeAllFree ?? this.assumeAllFree,
         manualModels: manualModels ?? this.manualModels,
+        manualModelsOnly: manualModelsOnly ?? this.manualModelsOnly,
         apiKey: apiKey ?? this.apiKey,
       );
 
@@ -120,26 +144,33 @@ class ProviderConfig {
         'enabled': enabled,
         'assumeAllFree': assumeAllFree,
         'manualModels': manualModels.map((m) => m.toJson()).toList(),
+        'manualModelsOnly': manualModelsOnly,
       };
 
-  factory ProviderConfig.fromJson(Map<String, dynamic> json) => ProviderConfig(
-        id: json['id'] as String,
-        name: (json['name'] ?? 'Provider') as String,
-        preset: ProviderPreset
-            .values[((json['preset'] as num?)?.toInt() ?? 3)
-                .clamp(0, ProviderPreset.values.length - 1)],
-        baseUrl: (json['baseUrl'] ?? '') as String,
-        modelsPath: (json['modelsPath'] ?? '/models') as String,
-        chatPath: (json['chatPath'] ?? '/chat/completions') as String,
-        extraHeaders:
-            (json['extraHeaders'] as Map?)?.cast<String, String>() ?? const {},
-        enabled: (json['enabled'] ?? false) as bool,
-        assumeAllFree: (json['assumeAllFree'] ?? false) as bool,
-        manualModels: ((json['manualModels'] as List?) ?? const [])
-            .whereType<Map>()
-            .map((m) => ManualModel.fromJson(m.cast<String, dynamic>()))
-            .toList(),
-      );
+  factory ProviderConfig.fromJson(Map<String, dynamic> json) {
+    final manual = ((json['manualModels'] as List?) ?? const [])
+        .whereType<Map>()
+        .map((m) => ManualModel.fromJson(m.cast<String, dynamic>()))
+        .toList();
+    return ProviderConfig(
+      id: json['id'] as String,
+      name: (json['name'] ?? 'Provider') as String,
+      preset: ProviderPreset
+          .values[((json['preset'] as num?)?.toInt() ?? 3)
+              .clamp(0, ProviderPreset.values.length - 1)],
+      baseUrl: (json['baseUrl'] ?? '') as String,
+      modelsPath: (json['modelsPath'] ?? '/models') as String,
+      chatPath: (json['chatPath'] ?? '/chat/completions') as String,
+      extraHeaders:
+          (json['extraHeaders'] as Map?)?.cast<String, String>() ?? const {},
+      enabled: (json['enabled'] ?? false) as bool,
+      assumeAllFree: (json['assumeAllFree'] ?? false) as bool,
+      manualModels: manual,
+      // Records saved before this flag existed keep a curated list curated.
+      manualModelsOnly:
+          (json['manualModelsOnly'] as bool?) ?? manual.isNotEmpty,
+    );
+  }
 
   static ProviderConfig defaultFor(ProviderPreset preset, {String? id}) {
     // Stable ids for named presets so re-connecting a preset reuses its

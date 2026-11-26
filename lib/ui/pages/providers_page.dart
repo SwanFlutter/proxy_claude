@@ -195,6 +195,7 @@ class _ProvidersPageState extends ConsumerState<ProvidersPage> {
         if (f != 0) return f;
         return a.name.toLowerCase().compareTo(b.name.toLowerCase());
       });
+    final anyDisabled = providers.any((p) => !p.enabled);
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
@@ -315,7 +316,33 @@ class _ProvidersPageState extends ConsumerState<ProvidersPage> {
         const SizedBox(height: 20),
 
         // ── Configured ────────────────────────────────────────────────────
-        const _SectionHeader('Configured'),
+        Row(
+          children: [
+            const Expanded(child: _SectionHeader('Configured')),
+            if (configured.isNotEmpty)
+              TextButton.icon(
+                onPressed: anyDisabled
+                    ? () => ref
+                        .read(providersProvider.notifier)
+                        .setEnabledAll(true)
+                    : null,
+                icon: const Icon(Icons.playlist_add_check, size: 15),
+                label: Text(anyDisabled
+                    ? 'Enable all'
+                    : 'All enabled (${configured.length})'),
+              ),
+          ],
+        ),
+        if (configured.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6, left: 4),
+            child: Text(
+              'Every connected provider feeds the shared `auto` model. '
+              'Disable one only to take it out of routing.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline),
+            ),
+          ),
         if (configured.isEmpty)
           _CatalogCard(children: [
             Padding(
@@ -635,8 +662,14 @@ class _ConfiguredRow extends StatelessWidget {
     final hasKey = provider.apiKey.isNotEmpty;
 
     final (Color dot, String status) = switch ((hasKey, provider.enabled, health)) {
-      (false, _, _) => (Colors.orange, 'API key required'),
-      (_, _, ProviderHealth(ok: false)) => (theme.colorScheme.error, 'Sync error'),
+      (false, _, _) => (
+          Colors.orange,
+          'API key required — not used for routing until it is set'
+        ),
+      (_, _, ProviderHealth(ok: false, :final error)) => (
+          theme.colorScheme.error,
+          error == null ? 'Sync error' : 'Sync error — $error',
+        ),
       (_, true, ProviderHealth(ok: true, :final modelCount)) =>
         (Colors.green, '$modelCount models'),
       (_, false, _) => (Colors.grey, 'Disabled'),
@@ -1101,6 +1134,7 @@ class _CustomProviderDialogState extends ConsumerState<_CustomProviderDialog> {
   late final TextEditingController _chatPathCtrl;
   late final TextEditingController _headersCtrl;
   bool _assumeFree = false;
+  bool _manualOnly = false;
   final List<_ModelRowCtl> _rows = [];
 
   bool _fetching = false;
@@ -1127,6 +1161,8 @@ class _CustomProviderDialogState extends ConsumerState<_CustomProviderDialog> {
     _headersCtrl = TextEditingController(
         text: headersToText(e?.extraHeaders ?? defaults.extraHeaders));
     _assumeFree = e?.assumeAllFree ?? false;
+    // A provider that already has a hand-written list stays curated.
+    _manualOnly = e?.manualModelsOnly ?? (e?.manualModels.isNotEmpty ?? false);
     for (final m in e?.manualModels ?? const <ManualModel>[]) {
       _rows.add(_ModelRowCtl(m.id, m.name));
     }
@@ -1158,7 +1194,11 @@ class _CustomProviderDialogState extends ConsumerState<_CustomProviderDialog> {
       modelsPath: _modelsPathCtrl.text.trim(),
       chatPath: _chatPathCtrl.text.trim(),
       extraHeaders: parseHeaders(_headersCtrl.text),
+      // Connecting a provider makes it part of the routing pool right away;
+      // managing an existing one keeps the current switch state.
+      enabled: widget.existing?.enabled ?? true,
       assumeAllFree: _assumeFree,
+      manualModelsOnly: _manualOnly,
       manualModels: _rows
           .map((r) =>
               ManualModel(id: r.id.text.trim(), name: r.name.text.trim()))
@@ -1414,6 +1454,19 @@ class _CustomProviderDialogState extends ConsumerState<_CustomProviderDialog> {
                 },
               ),
               const SizedBox(height: 4),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Use only the models listed above'),
+                subtitle: Text(
+                  'Curated list: the provider’s /models endpoint is never fetched, '
+                  'so its other models are not added. Turn this off to import the '
+                  'full catalogue on every sync.',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.outline),
+                ),
+                value: _manualOnly,
+                onChanged: (v) => setState(() => _manualOnly = v),
+              ),
               Theme(
                 data: theme.copyWith(dividerColor: Colors.transparent),
                 child: ExpansionTile(

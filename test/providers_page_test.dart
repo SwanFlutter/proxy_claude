@@ -78,6 +78,32 @@ void main() {
     expect(find.text('Connect'), findsNWidgets(3));
   });
 
+  testWidgets('a disabled provider offers a one-tap Enable all', (tester) async {
+    final disabled = ProviderConfig.defaultFor(ProviderPreset.groq)
+        .copyWith(enabled: false, apiKey: 'test-key');
+    await tester.pumpWidget(makePage(providers: [disabled]));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Disabled'), findsOneWidget);
+    expect(find.text('Enable all'), findsOneWidget);
+  });
+
+  testWidgets('a keyless provider says it is not used for routing',
+      (tester) async {
+    final keyless = ProviderConfig.defaultFor(ProviderPreset.googleGemini)
+        .copyWith(enabled: true);
+    await tester.pumpWidget(makePage(providers: [keyless]));
+    await tester.pumpAndSettle();
+
+    // The Configured section sits below the catalog in a lazy ListView.
+    await tester.scrollUntilVisible(
+        find.textContaining('API key required'), 240,
+        scrollable: find.byType(Scrollable).first);
+    expect(
+        find.textContaining('API key required — not used for routing'),
+        findsOneWidget);
+  });
+
   testWidgets('custom provider form matches the Zed-style layout',
       (tester) async {
     await tester.pumpWidget(makePage());
